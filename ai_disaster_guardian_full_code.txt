@@ -1,0 +1,428 @@
+# AI Disaster Guardian - Full Code in One File
+# =============================================
+
+
+
+# FILE: requirements.txt
+
+fastapi==0.95.2
+uvicorn==0.22.0
+pydantic==1.10.11
+joblib==1.3.2
+scikit-learn==1.3.2
+numpy==1.26.5
+pandas==2.2.2
+aiohttp==3.9.4
+
+
+
+# FILE: README.md
+
+# AI Disaster Guardian (Minimal Demo)
+
+## Overview
+A minimal multi-agent prototype for early warning & rapid response. Agents communicate through a simple EventBus.
+
+## Quickstart
+1. Create a virtualenv and install:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # Windows: venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+
+2. (Optional) Train the toy model:
+   ```bash
+   python models/train_model.py
+   ```
+
+3. Run demo (console):
+   ```bash
+   python demo_simulation.py
+   ```
+
+or run FastAPI HTTP server:
+   ```bash
+   python api/main.py
+   # then open http://127.0.0.1:8000/health
+   ```
+
+## Files
+- `agents/` — agent implementations
+- `event_bus.py` — simple pub/sub
+- `models/train_model.py` — synthetic training script
+- `api/main.py` — FastAPI entrypoint
+- `demo_simulation.py` — run a console demo
+
+
+
+# FILE: event_bus.py
+
+# event_bus.py
+# Simple publish/subscribe event bus using asyncio.Queue
+import asyncio
+from typing import Callable, Dict, List, Any
+import uuid
+
+class Event:
+    def __init__(self, type: str, payload: dict):
+        self.id = str(uuid.uuid4())
+        self.type = type
+        self.payload = payload
+
+class EventBus:
+    def __init__(self):
+        self._subscribers: Dict[str, List[Callable[[Event], None]]] = {}
+        self._queue = asyncio.Queue()
+
+    async def publish(self, event: Event):
+        await self._queue.put(event)
+
+    def subscribe(self, event_type: str, callback: Callable[[Event], None]):
+        if event_type not in self._subscribers:
+            self._subscribers[event_type] = []
+        self._subscribers[event_type].append(callback)
+
+    async def start(self):
+        while True:
+            event: Event = await self._queue.get()
+            subs = self._subscribers.get(event.type, [])
+            for cb in subs:
+                # callbacks may be sync or async
+                try:
+                    maybe_coro = cb(event)
+                    if asyncio.iscoroutine(maybe_coro):
+                        asyncio.create_task(maybe_coro)
+                except Exception as e:
+                    # swallow subscriber errors so bus loop keeps running
+                    print(f"[EventBus] subscriber error: {e}")
+            self._queue.task_done()
+
+
+
+# FILE: demo_simulation.py
+
+# demo_simulation.py
+# Run this to demo system locally (no FastAPI). Prints events to console.
+import asyncio
+from event_bus import Event, EventBus
+from agents.data_watcher import DataWatcherAgent
+from agents.risk_analyzer import RiskAnalyzerAgent
+from agents.alert_strategist import AlertStrategistAgent
+from agents.response_planner import ResponsePlannerAgent
+from agents.communication_agent import CommunicationAgent
+
+async def main():
+    bus = EventBus()
+    # setup subscribers/agents
+    data_watcher = DataWatcherAgent(bus=bus, poll_interval=1.0)
+    risk_analyzer = RiskAnalyzerAgent(bus=bus)
+    alert_agent = AlertStrategistAgent(bus=bus)
+    response_planner = ResponsePlannerAgent(bus=bus)
+    comm_agent = CommunicationAgent(bus=bus)
+
+    # subscribe simple logger for risk_assessment and response_plan events (for visible output)
+    async def logger(event: Event):
+        print(f"[LOG] {event.type}: {event.payload}")
+    bus.subscribe("risk_assessment", logger)
+    bus.subscribe("alert", logger)
+    bus.subscribe("response_plan", logger)
+
+    # run event bus and data watcher concurrently
+    await asyncio.gather(
+        bus.start(),
+        data_watcher.start()
+    )
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Demo stopped.")
+
+
+
+# FILE: agents/__init__.py
+
+
+
+
+# FILE: agents/data_watcher.py
+
+# agents/data_watcher.py
+import asyncio
+import random
+from datetime import datetime
+from event_bus import Event, EventBus
+
+class DataWatcherAgent:
+    def __init__(self, bus: EventBus, poll_interval: float = 2.0):
+        self.bus = bus
+        self.poll_interval = poll_interval
+        self.running = False
+
+    async def start(self):
+        self.running = True
+        while self.running:
+            # Simulate streaming sensors: rainfall, river_level, wind_speed, temperature
+            reading = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "rainfall_mm": round(random.random() * 200, 2),
+                "river_level_m": round(random.random() * 10, 2),
+                "wind_speed_kmh": round(random.random() * 150, 1),
+                "temperature_c": round(10 + random.random() * 30, 1),
+                "source": "simulator"
+            }
+            event = Event(type="raw_data", payload=reading)
+            await self.bus.publish(event)
+            await asyncio.sleep(self.poll_interval)
+
+    def stop(self):
+        self.running = False
+
+
+
+# FILE: agents/risk_analyzer.py
+
+# agents/risk_analyzer.py
+import asyncio
+from event_bus import Event, EventBus
+import joblib
+import numpy as np
+
+class RiskAnalyzerAgent:
+    def __init__(self, bus: EventBus, model_path: str = "models/rf_model.joblib"):
+        self.bus = bus
+        self.model_path = model_path
+        try:
+            self.model = joblib.load(self.model_path)
+        except Exception:
+            self.model = None
+        # subscribe to raw data
+        bus.subscribe("raw_data", self.on_raw_data)
+
+    async def on_raw_data(self, event: Event):
+        payload = event.payload
+        features = np.array([[payload["rainfall_mm"], payload["river_level_m"], payload["wind_speed_kmh"], payload["temperature_c"]]])
+        # if model exists, predict; otherwise simple heuristic
+        if self.model:
+            try:
+                score = float(self.model.predict_proba(features)[0,1])  # probability of 'high risk'
+            except Exception:
+                score = min(1.0, (payload["rainfall_mm"]/200 + payload["river_level_m"]/10 + payload["wind_speed_kmh"]/150)/3)
+        else:
+            # heuristic: normalize and combine
+            score = min(1.0, (payload["rainfall_mm"]/200 + payload["river_level_m"]/10 + payload["wind_speed_kmh"]/150)/3)
+        risk_event = Event(type="risk_assessment", payload={
+            "timestamp": payload["timestamp"],
+            "risk_score": round(score, 4),
+            "features": payload
+        })
+        await self.bus.publish(risk_event)
+
+
+
+# FILE: agents/alert_strategist.py
+
+# agents/alert_strategist.py
+from event_bus import Event, EventBus
+
+class AlertStrategistAgent:
+    def __init__(self, bus: EventBus, thresholds=None):
+        self.bus = bus
+        self.thresholds = thresholds or {"low":0.2, "medium":0.5, "high":0.75}
+        bus.subscribe("risk_assessment", self.on_risk_assessment)
+
+    async def on_risk_assessment(self, event: Event):
+        score = event.payload["risk_score"]
+        level = "none"
+        if score >= self.thresholds["high"]:
+            level = "high"
+        elif score >= self.thresholds["medium"]:
+            level = "medium"
+        elif score >= self.thresholds["low"]:
+            level = "low"
+
+        if level != "none":
+            alert = {
+                "timestamp": event.payload["timestamp"],
+                "level": level,
+                "score": score,
+                "message": f"Detected {level} risk (score={score})",
+                "recommendation": self._recommend(level)
+            }
+            await self.bus.publish(Event(type="alert", payload=alert))
+
+    def _recommend(self, level):
+        if level == "high":
+            return {"action": "evacuate", "priority": "immediate"}
+        if level == "medium":
+            return {"action": "prepare", "priority": "soon"}
+        return {"action": "monitor", "priority": "low"}
+
+
+
+# FILE: agents/response_planner.py
+
+# agents/response_planner.py
+from event_bus import Event, EventBus
+import random
+
+class ResponsePlannerAgent:
+    def __init__(self, bus: EventBus):
+        self.bus = bus
+        bus.subscribe("alert", self.on_alert)
+
+    async def on_alert(self, event: Event):
+        alert = event.payload
+        # create simple plan: choose nearest shelters (simulated) and resources
+        shelters = [
+            {"id":"S1","lat":12.95,"lon":77.60,"capacity":200},
+            {"id":"S2","lat":12.97,"lon":77.59,"capacity":150},
+            {"id":"S3","lat":13.00,"lon":77.62,"capacity":300}
+        ]
+        chosen = random.sample(shelters, k=2)
+        plan = {
+            "alert": alert,
+            "evacuation_routes": [
+                {"from":"zoneA","to":chosen[0]["id"], "eta_min":random.randint(10,30)},
+                {"from":"zoneB","to":chosen[1]["id"], "eta_min":random.randint(15,40)}
+            ],
+            "resources": {"boats": random.randint(0,5), "ambulances": random.randint(1,5)}
+        }
+        await self.bus.publish(Event(type="response_plan", payload=plan))
+
+
+
+# FILE: agents/communication_agent.py
+
+# agents/communication_agent.py
+from event_bus import Event, EventBus
+import asyncio
+
+class CommunicationAgent:
+    def __init__(self, bus: EventBus):
+        self.bus = bus
+        self.logs = []
+        bus.subscribe("alert", self.on_alert)
+        bus.subscribe("response_plan", self.on_plan)
+
+    async def on_alert(self, event: Event):
+        # format alert and "send" (here we log)
+        msg = {
+            "type": "public_alert",
+            "payload": event.payload
+        }
+        self._log(msg)
+        # simulate message sending delay
+        await asyncio.sleep(0.2)
+
+    async def on_plan(self, event: Event):
+        msg = {
+            "type": "responder_message",
+            "payload": event.payload
+        }
+        self._log(msg)
+        await asyncio.sleep(0.2)
+
+    def _log(self, msg):
+        print(f"[COMM] {msg['type']}: {msg['payload']}")
+        self.logs.append(msg)
+
+
+
+# FILE: models/train_model.py
+
+# models/train_model.py
+# Minimal script to create a mock classifier to save as models/rf_model.joblib
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+import joblib, os, sys
+
+def make_synthetic_data(n=2000):
+    X = np.random.rand(n,4)
+    X[:,0] *= 200
+    X[:,1] *= 10
+    X[:,2] *= 150
+    X[:,3] = 10 + X[:,3]*30
+    y = ((X[:,0]/200 + X[:,1]/10 + X[:,2]/150) / 3 > 0.55).astype(int)
+    return X, y
+
+def train_and_save(path="models/rf_model.joblib"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    X, y = make_synthetic_data()
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf.fit(X_train, y_train)
+    joblib.dump(clf, path)
+    print("Saved model to", path)
+
+if __name__ == '__main__':
+    try:
+        train_and_save()
+    except Exception as e:
+        print('Training failed:', e)
+        sys.exit(1)
+
+
+
+# FILE: api/main.py
+
+# api/main.py
+import asyncio
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from event_bus import EventBus
+from agents.data_watcher import DataWatcherAgent
+from agents.risk_analyzer import RiskAnalyzerAgent
+from agents.alert_strategist import AlertStrategistAgent
+from agents.response_planner import ResponsePlannerAgent
+from agents.communication_agent import CommunicationAgent
+import uvicorn
+import threading
+import time
+
+app = FastAPI()
+bus = EventBus()
+
+# Instantiate agents
+data_watcher = DataWatcherAgent(bus=bus, poll_interval=1.5)
+risk_analyzer = RiskAnalyzerAgent(bus=bus)
+alert_agent = AlertStrategistAgent(bus=bus)
+response_planner = ResponsePlannerAgent(bus=bus)
+comm_agent = CommunicationAgent(bus=bus)
+
+# Start the event bus loop in background thread
+def start_bus_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bus.start())
+
+@app.on_event("startup")
+def startup_event():
+    # start bus in a background loop
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(target=start_bus_loop, args=(loop,), daemon=True)
+    t.start()
+    # run agents in same new loop by scheduling coroutines there
+    async def start_agents():
+        # create tasks for agents that have start methods
+        await asyncio.sleep(0.1)  # small delay to ensure bus loop is running
+        asyncio.create_task(data_watcher.start())
+    asyncio.run_coroutine_threadsafe(start_agents(), loop)
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"status":"ok"})
+
+@app.get("/status")
+async def status():
+    # expose communication logs and a snapshot
+    return {
+        "comm_logs_count": len(comm_agent.logs),
+        "last_logs": comm_agent.logs[-5:]
+    }
+
+if __name__ == "__main__":
+    uvicorn.run("api.main:app", host="127.0.0.1", port=8000, reload=False)
+
